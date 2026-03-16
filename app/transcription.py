@@ -14,7 +14,7 @@ async def transcribe_audio(filename: str, file_bytes: bytes, language: str | Non
         if language:
             data["language"] = language
         resp = await client.post(
-            f"{settings.WHISPER_BASE_URL}/transcribe",
+            f"{settings.WHISPER_BASE_URL}/v1/audio/transcriptions",
             data=data,
             files=files,
         )
