@@ -1,0 +1,19 @@
+# Local env
+.env
+.env.local
+
+# Project folders to ignore
+ideas/
+old/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
