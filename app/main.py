@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from qdrant_client.http import models as qmodels
 
 from .config import settings
-from .db import get_session
+from .db import get_session, create_tables
 from .models import Inbox, Vector
 from .schemas import (
     DocResponse,
@@ -36,6 +36,7 @@ app = FastAPI(title="OpenBrain Chunking API")
 
 @app.on_event("startup")
 def _startup() -> None:
+    create_tables()
     client = get_qdrant_client()
     try:
         ensure_collection(client)

@@ -15,6 +15,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+def create_tables() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
 def get_session() -> Session:
     """
     FastAPI dependency that yields a SQLAlchemy session.
