@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from qdrant_client.http import models as qmodels
 
@@ -18,6 +19,7 @@ from .schemas import (
     SearchByVectorIdRequest,
     SearchHit,
     SearchResponse,
+    TranscribeEmbedResponse,
     TranscribeResponse,
 )
 from .chunking import chunk_text
@@ -318,6 +320,38 @@ async def ingest_document(
     )
 
 
+@app.get("/doc/{inbox_id}/file")
+def download_doc(inbox_id: str, session: SessionDep) -> Response:
+    inbox: Inbox | None = session.query(Inbox).get(inbox_id)
+    if inbox is None or inbox.type != "document":
+        raise HTTPException(status_code=404, detail="document not found")
+    if not inbox.filename:
+        raise HTTPException(status_code=404, detail="no filename on record")
+
+    s3 = get_s3_client()
+    try:
+        obj = s3.get_object(Bucket=settings.S3_BUCKET_FILES, Key=inbox.filename)
+        data = obj["Body"].read()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"S3 fetch failed: {exc}") from exc
+
+    # Guess content-type from filetype/filename
+    ft = (inbox.filetype or inbox.filename.rsplit(".", 1)[-1]).lower()
+    content_type_map = {
+        "pdf": "application/pdf",
+        "txt": "text/plain",
+        "md":  "text/markdown",
+        "csv": "text/csv",
+    }
+    content_type = content_type_map.get(ft, "application/octet-stream")
+
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{inbox.filename}"'},
+    )
+
+
 @app.post("/search/text", response_model=SearchResponse)
 async def search_by_text(payload: SearchByTextRequest, session: SessionDep) -> SearchResponse:
     client = get_qdrant_client()
@@ -403,6 +437,101 @@ async def transcribe_endpoint(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Transcription failed: {exc}") from exc
     return TranscribeResponse(text=text)
+
+
+@app.post("/transcribe/embed", response_model=TranscribeEmbedResponse)
+async def transcribe_and_embed(
+    session: SessionDep,
+    file: UploadFile = File(...),
+    language: str | None = Form(default=None),
+    source: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+) -> TranscribeEmbedResponse:
+    filename = file.filename or "audio"
+    data = await file.read()
+
+    # Step 1: transcribe
+    try:
+        text = await transcribe_audio(filename, data, language=language)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Transcription failed: {exc}") from exc
+
+    # Step 2: store audio in S3, create inbox row as a document
+    filetype = filename.rsplit(".", 1)[-1].lower() if "." in filename else "audio"
+    if settings.ENVIRONMENT != "local":
+        s3 = get_s3_client()
+        try:
+            s3.put_object(Bucket=settings.S3_BUCKET_FILES, Key=filename, Body=data)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"S3 upload failed: {exc}") from exc
+
+    inbox = Inbox(
+        raw_text=text,
+        type="document",
+        source=source or "whisper",
+        session_id=session_id,
+        filename=filename,
+        filetype=filetype,
+        confidence=1.0,
+        status="pending",
+        vectorised=False,
+        fields={"minio_key": filename, "transcript": True},
+    )
+    session.add(inbox)
+    session.flush()
+    _plog(session, inbox.id, "inbox_created", detail=f"audio doc filename={filename} chars={len(text)}")
+
+    # Step 3: chunk → embed → write vectors → neighbours
+    chunks = chunk_text(text)
+    chunk_count = len(chunks)
+    points: list[qmodels.PointStruct] = []
+    embeddings: list[list[float]] = []
+
+    if chunk_count == 0:
+        inbox.status = "ok"
+        inbox.vectorised = True
+        _plog(session, inbox.id, "chunk", status="skipped", detail="empty transcript")
+        return TranscribeEmbedResponse(text=text, inbox_id=str(inbox.id), chunk_count=0, embedded=False)
+
+    client = get_qdrant_client()
+    try:
+        for idx, chunk_text_value in chunks:
+            vec = Vector(inbox_id=inbox.id, chunk_index=idx, chunk_text=chunk_text_value)
+            session.add(vec)
+            session.flush()
+            embedding = await get_embedding(chunk_text_value)
+            embeddings.append(embedding)
+            points.append(
+                qmodels.PointStruct(
+                    id=str(vec.id),
+                    vector={"dense": embedding},
+                    payload={
+                        "inbox_id": str(inbox.id),
+                        "chunk_index": idx,
+                        "type": "document",
+                        "source": inbox.source,
+                        "filename": filename,
+                    },
+                )
+            )
+            _plog(session, inbox.id, "chunk", detail=f"idx={idx} vec={vec.id}")
+
+        upsert_vectors(client, points)
+        _plog(session, inbox.id, "qdrant_upsert", detail=f"points={len(points)}")
+
+        _write_neighbours(session, client, str(inbox.id), embeddings)
+        _plog(session, inbox.id, "neighbour", detail=f"searched from {len(embeddings)} chunk(s)")
+    except Exception as exc:  # noqa: BLE001
+        inbox.status = "embed_error"
+        inbox.vectorised = False
+        _plog(session, inbox.id, "embed_error", status="error", detail=str(exc))
+        raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}") from exc
+
+    inbox.status = "ok"
+    inbox.vectorised = True
+    _plog(session, inbox.id, "vectorised", detail=f"chunks={chunk_count}")
+
+    return TranscribeEmbedResponse(text=text, inbox_id=str(inbox.id), chunk_count=chunk_count, embedded=True)
 
 
 def get_app() -> FastAPI:

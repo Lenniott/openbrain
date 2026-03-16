@@ -59,3 +59,10 @@ class SearchResponse(BaseModel):
 class TranscribeResponse(BaseModel):
     text: str
 
+
+class TranscribeEmbedResponse(BaseModel):
+    text: str
+    inbox_id: str
+    chunk_count: int
+    embedded: bool
+

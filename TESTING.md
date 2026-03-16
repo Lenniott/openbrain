@@ -95,6 +95,16 @@ Response: `{ status, inbox_id, filename, is_new, chunk_count }`
 
 ---
 
+### GET /doc/{inbox_id}/file — download the original file
+
+```bash
+curl http://localhost:7788/doc/<inbox_id>/file -o downloaded.pdf
+```
+
+Returns the raw file from S3 with the correct `Content-Type` and `Content-Disposition` headers. Useful for verifying what actually got stored after a `/doc` upload.
+
+---
+
 ### POST /search/text — semantic search by query
 
 ```bash
@@ -117,7 +127,7 @@ curl -X POST http://localhost:7788/search/vector \
 
 ---
 
-### POST /transcribe — audio to text
+### POST /transcribe — audio to text only
 
 ```bash
 curl -X POST http://localhost:7788/transcribe \
@@ -125,7 +135,29 @@ curl -X POST http://localhost:7788/transcribe \
   -F "language=en"
 ```
 
-Response: `{ text: "..." }` — caller then sends text to `/embed` if needed.
+Response: `{ text: "..." }` — use this when you just want the transcript back.
+
+---
+
+### POST /transcribe/embed — audio to text to vectors (full pipeline)
+
+Transcribes the audio, stores the audio file in S3, creates a `document` in `ob_inbox` with the transcript as `raw_text`, chunks and embeds, writes neighbours. The original audio is retrievable via `GET /doc/{inbox_id}/file`. One shot.
+
+```bash
+curl -X POST http://localhost:7788/transcribe/embed \
+  -F "file=@/path/to/audio.m4a" \
+  -F "language=en" \
+  -F "source=shortcut" \
+  -F "session_id=test-session-1"
+```
+
+Form fields:
+- `file` (required) — mp3, m4a, wav
+- `language` (optional) — hint for Whisper
+- `source` (optional) — defaults to `whisper`
+- `session_id` (optional)
+
+Response: `{ text, inbox_id, chunk_count, embedded: true|false }`
 
 ---
 
@@ -386,6 +418,58 @@ Expected: hits with non-zero scores, chunk_text populated, inbox_id valid.
 
 ---
 
+### 9. Audio — transcribe and embed
+
+```bash
+curl -X POST http://localhost:7788/transcribe/embed \
+  -F "file=@/path/to/voice-memo.m4a" \
+  -F "language=en" \
+  -F "source=shortcut" \
+  -F "session_id=test-audio-1"
+```
+
+Expected: `{ text: "...", inbox_id: "...", chunk_count: N, embedded: true }`
+
+Verify the full pipeline ran:
+```sql
+SELECT step, status, detail FROM ob_pipeline_log WHERE inbox_id = '<id>' ORDER BY created_at;
+-- inbox_created (audio doc), chunk(s), qdrant_upsert, neighbour, vectorised
+```
+
+Verify stored as a document with transcript:
+```sql
+SELECT type, filetype, filename, length(raw_text) AS transcript_len,
+       fields->>'transcript' AS is_transcript, vectorised
+FROM ob_inbox WHERE id = '<id>';
+-- type=document, filetype=m4a, transcript=true, vectorised=true
+```
+
+Verify audio file is in S3:
+```bash
+curl http://localhost:7788/doc/<id>/file -o recovered.m4a
+# should download the original audio
+```
+
+---
+
+### 10. File download — recover a stored document
+
+After any `/doc` upload or `/transcribe/embed`:
+
+```bash
+# Download as file
+curl http://localhost:7788/doc/<inbox_id>/file -o output.pdf
+
+# Or in browser — just open:
+# http://localhost:7788/doc/<inbox_id>/file
+```
+
+Expected: file downloads with correct content type (`application/pdf`, `text/plain`, `audio/mp4`, etc.)
+
+Returns `404` if the inbox_id doesn't exist or isn't a document type.
+
+---
+
 ## Common failure patterns
 
 | Symptom | Where to look |
@@ -397,6 +481,8 @@ Expected: hits with non-zero scores, chunk_text populated, inbox_id valid.
 | No neighbours written | Check `neighbour` step — only fires if there are other points already in Qdrant |
 | `no_change` when you expected re-embed | Jaccard change ratio below 5% — the text changes were minor |
 | `400 Unsupported file type` on `/doc` | Only `pdf`, `txt`, `md` supported currently |
+| `502 Transcription failed` on `/transcribe/embed` | Whisper service unreachable — check `WHISPER_BASE_URL` |
+| Audio embedded but `raw_text` empty | Whisper returned blank — try with `language=en` form field |
 
 ---
 
