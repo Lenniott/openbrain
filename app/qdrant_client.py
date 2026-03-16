@@ -22,12 +22,25 @@ def ensure_collection(client: QdrantClient) -> None:
     if settings.QDRANT_COLLECTION in names:
         return
 
-    client.recreate_collection(
-        collection_name=settings.QDRANT_COLLECTION,
-        vectors_config=qmodels.VectorParams(
+    # Dense vector config (768d cosine) plus sparse vector slot called "sparse".
+    vectors_config: dict[str, Any] = {
+        "dense": qmodels.VectorParams(
             size=768,
             distance=qmodels.Distance.COSINE,
-        ),
+        )
+    }
+
+    sparse_vectors_config = {
+        "sparse": qmodels.SparseVectorParams(
+            index=qmodels.SparseIndexParams()
+        )
+    }
+
+    client.recreate_collection(
+        collection_name=settings.QDRANT_COLLECTION,
+        vectors_config=vectors_config,
+        sparse_vectors_config=sparse_vectors_config,
+        on_disk_payload=True,
     )
 
 
@@ -51,7 +64,7 @@ def search_by_vector(
 ) -> list[qmodels.ScoredPoint]:
     return client.search(
         collection_name=settings.QDRANT_COLLECTION,
-        query_vector=query_vector,
+        query_vector=("dense", query_vector),
         limit=limit,
         query_filter=filters,
     )

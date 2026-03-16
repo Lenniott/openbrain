@@ -14,3 +14,18 @@ def get_s3_client():
         config=Config(s3={"addressing_style": "path"}),
     )
 
+
+def ensure_bucket_exists(bucket_name: str) -> None:
+    client = get_s3_client()
+    existing = client.list_buckets()
+    names = {b["Name"] for b in existing.get("Buckets", [])}
+    if bucket_name in names:
+        return
+    try:
+        client.create_bucket(
+            Bucket=bucket_name,
+            CreateBucketConfiguration={"LocationConstraint": settings.S3_REGION},
+        )
+    except client.exceptions.BucketAlreadyOwnedByYou:
+        return
+

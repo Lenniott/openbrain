@@ -1,18 +1,93 @@
-version: "3.9"
-
 services:
-  openbrain-api:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: openbrain-api
+    depends_on:
+      - postgres
+      - qdrant
+      - minio
     ports:
-      - "${APP_PORT:-7788}:8000"
+      - "7788:8000"   # API (container 8000 -> host 7788)
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-openbrain}
+      - POSTGRES_USER=${POSTGRES_USER:-openbrain}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-openbrain}
+      - QDRANT_HOST=${QDRANT_HOST:-qdrant}
+      - QDRANT_PORT=${QDRANT_PORT:-6333}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-openbrain}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-openbrain}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-openbrain_secret}
+      - S3_BUCKET_FILES=${S3_BUCKET_FILES:-files}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-http://localhost:11434}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - EMBEDDING_TIMEOUT_SECONDS=${EMBEDDING_TIMEOUT_SECONDS:-15}
+      - WHISPER_BASE_URL=${WHISPER_BASE_URL:-http://localhost:7777}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
+      - WHISPER_TIMEOUT_SECONDS=${WHISPER_TIMEOUT_SECONDS:-60}
+      - CHUNK_SIZE=${CHUNK_SIZE:-600}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.8}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
     networks:
-      - n8n_net
+      - openbrain_net
     restart: unless-stopped
 
+  postgres:
+    image: postgres:15
+    container_name: openbrain-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-openbrain}
+      - POSTGRES_USER=${POSTGRES_USER:-openbrain}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-openbrain}
+    ports:
+      - "55432:5432"  # Postgres (default 5432, using 55432 on host)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    networks:
+      - openbrain_net
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: openbrain-qdrant
+    ports:
+      - "26333:6333"  # Qdrant (default 6333, using 26333 on host)
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - openbrain_net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: openbrain-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY_ID:-openbrain}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_ACCESS_KEY:-openbrain_secret}
+    ports:
+      - "29000:9000"  # Minio API (default 9000, using 29000 on host)
+      - "29001:9001"  # Minio console
+    volumes:
+      - minio_data:/data
+    networks:
+      - openbrain_net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  qdrant_storage:
+  minio_data:
+
 networks:
-  n8n_net:
-    external: true
+  openbrain_net:
+    driver: bridge
 

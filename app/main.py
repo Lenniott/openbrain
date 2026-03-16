@@ -24,7 +24,7 @@ from .chunking import chunk_text
 from .diffing import jaccard_change_ratio
 from .embedding import get_embedding
 from .qdrant_client import get_qdrant_client, ensure_collection, upsert_vectors, search_by_vector
-from .s3_client import get_s3_client
+from .s3_client import get_s3_client, ensure_bucket_exists
 from .transcription import transcribe_audio
 
 
@@ -37,7 +37,14 @@ app = FastAPI(title="OpenBrain Chunking API")
 @app.on_event("startup")
 def _startup() -> None:
     client = get_qdrant_client()
-    ensure_collection(client)
+    try:
+        ensure_collection(client)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] Warning: could not ensure Qdrant collection: {exc}")
+    try:
+        ensure_bucket_exists(settings.S3_BUCKET_FILES)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] Warning: could not ensure Minio bucket '{settings.S3_BUCKET_FILES}': {exc}")
 
 
 @app.get("/health")
@@ -89,7 +96,7 @@ async def embed_text(payload: EmbedRequest, session: SessionDep) -> EmbedRespons
             points.append(
                 qmodels.PointStruct(
                     id=str(vec.id),
-                    vector=embedding,
+                    vector={"dense": embedding},
                     payload={
                         "inbox_id": str(inbox.id),
                         "chunk_index": idx,
@@ -108,7 +115,7 @@ async def embed_text(payload: EmbedRequest, session: SessionDep) -> EmbedRespons
                 points.append(
                     qmodels.PointStruct(
                         id=str(vec.id),
-                        vector=embedding,
+                        vector={"dense": embedding},
                         payload={
                             "inbox_id": str(inbox.id),
                             "chunk_index": idx,
@@ -144,6 +151,34 @@ async def ingest_document(
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required (x-ob-filename or file.filename)")
 
+    data = await file.read()
+
+    # In purely local mode we may not have Minio/Qdrant running; just create/update inbox
+    # and skip external calls so the endpoint can be tested in isolation.
+    if settings.ENVIRONMENT == "local":
+        existing: Inbox | None = (
+            session.query(Inbox)
+            .filter(Inbox.filename == filename, Inbox.type == "document")
+            .one_or_none()
+        )
+        if existing is None:
+            inbox = Inbox(
+                raw_text=x_ob_description or "",
+                source=x_ob_source or "unknown",
+                type="document",
+                filename=filename,
+                filetype=x_ob_filetype,
+                session_id=x_ob_session_id,
+                status="pending",
+                confidence=1.0,
+                vectorised=False,
+                fields={"note": "local-test-no-s3"},
+            )
+            session.add(inbox)
+            session.flush()
+            return DocResponse(status="ok", inbox_id=str(inbox.id), filename=filename, is_new=True)
+        return DocResponse(status="ok", inbox_id=str(existing.id), filename=filename, is_new=False)
+
     existing: Inbox | None = (
         session.query(Inbox)
         .filter(Inbox.filename == filename, Inbox.type == "document")
@@ -152,8 +187,6 @@ async def ingest_document(
 
     s3 = get_s3_client()
     client = get_qdrant_client()
-
-    data = await file.read()
 
     if existing is None:
         # New document path
