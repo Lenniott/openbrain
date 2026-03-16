@@ -6,8 +6,6 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: openbrain-api
-    env_file:
-      - .env
     ports:
       - "${APP_PORT:-7788}:8000"
     networks:
