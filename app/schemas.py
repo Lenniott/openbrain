@@ -25,6 +25,7 @@ class DocResponse(BaseModel):
     inbox_id: str | None = None
     filename: str | None = None
     is_new: bool | None = None
+    chunk_count: int | None = None
     error: str | None = None
 
 

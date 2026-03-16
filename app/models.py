@@ -57,3 +57,24 @@ class Vector(Base):
 
     inbox = relationship("Inbox", back_populates="vectors")
 
+
+class PipelineLog(Base):
+    __tablename__ = "ob_pipeline_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    inbox_id = Column(UUID(as_uuid=True), nullable=True)
+    step = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="ok")
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Neighbour(Base):
+    __tablename__ = "ob_neighbours"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    entity_id = Column(UUID(as_uuid=True), nullable=False)
+    neighbour_id = Column(UUID(as_uuid=True), nullable=False)
+    distance = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+

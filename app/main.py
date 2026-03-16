@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from qdrant_client.http import models as qmodels
 
 from .config import settings
 from .db import get_session, create_tables
-from .models import Inbox, Vector
+from .models import Inbox, Neighbour, PipelineLog, Vector
 from .schemas import (
     DocResponse,
     EmbedRequest,
@@ -22,8 +22,9 @@ from .schemas import (
 )
 from .chunking import chunk_text
 from .diffing import jaccard_change_ratio
+from .doc_extraction import extract_text
 from .embedding import get_embedding
-from .qdrant_client import get_qdrant_client, ensure_collection, upsert_vectors, search_by_vector
+from .qdrant_client import get_qdrant_client, ensure_collection, find_neighbours, upsert_vectors, search_by_vector
 from .s3_client import get_s3_client, ensure_bucket_exists
 from .transcription import transcribe_audio
 
@@ -32,6 +33,35 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 
 app = FastAPI(title="OpenBrain Chunking API")
+
+
+def _plog(session: Session, inbox_id, step: str, status: str = "ok", detail: str | None = None) -> None:
+    session.add(PipelineLog(inbox_id=inbox_id, step=step, status=status, detail=detail))
+
+
+def _write_neighbours(
+    session: Session,
+    qdrant_client,
+    inbox_id: str,
+    embeddings_by_chunk: list[list[float]],
+) -> None:
+    """
+    For each chunk embedding, find nearest neighbours in Qdrant (excluding
+    same inbox), deduplicate at inbox level, and write to ob_neighbours.
+    Called after upsert_vectors so the new points are already searchable.
+    """
+    seen_pairs: set[tuple[str, str]] = set()
+    for embedding in embeddings_by_chunk:
+        for neighbour_inbox_id, distance in find_neighbours(qdrant_client, embedding, exclude_inbox_id=inbox_id):
+            pair = (inbox_id, neighbour_inbox_id)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            session.add(Neighbour(
+                entity_id=inbox_id,
+                neighbour_id=neighbour_inbox_id,
+                distance=distance,
+            ))
 
 
 @app.on_event("startup")
@@ -69,6 +99,7 @@ async def embed_text(payload: EmbedRequest, session: SessionDep) -> EmbedRespons
     )
     session.add(inbox)
     session.flush()
+    _plog(session, inbox.id, "inbox_created", detail=f"type={payload.type} source={payload.source}")
 
     text = payload.raw_text or ""
     chunks = chunk_text(text)
@@ -76,24 +107,26 @@ async def embed_text(payload: EmbedRequest, session: SessionDep) -> EmbedRespons
 
     if confidence < settings.CONFIDENCE_THRESHOLD:
         inbox.status = "needs_review"
+        _plog(session, inbox.id, "low_confidence", status="skipped", detail=f"confidence={confidence}")
         return EmbedResponse(inbox_id=str(inbox.id), chunk_count=chunk_count, embedded=False)
 
     client = get_qdrant_client()
     points: list[qmodels.PointStruct] = []
 
     if chunk_count == 0:
-        # nothing to embed
         inbox.status = "ok"
         inbox.vectorised = True
+        _plog(session, inbox.id, "chunk", status="skipped", detail="empty text")
         return EmbedResponse(inbox_id=str(inbox.id), chunk_count=0, embedded=False)
 
+    embeddings: list[list[float]] = []
     try:
-        if chunk_count == 1:
-            idx, chunk_text_value = chunks[0]
+        for idx, chunk_text_value in chunks:
             vec = Vector(inbox_id=inbox.id, chunk_index=idx, chunk_text=chunk_text_value)
             session.add(vec)
             session.flush()
             embedding = await get_embedding(chunk_text_value)
+            embeddings.append(embedding)
             points.append(
                 qmodels.PointStruct(
                     id=str(vec.id),
@@ -107,34 +140,22 @@ async def embed_text(payload: EmbedRequest, session: SessionDep) -> EmbedRespons
                     },
                 )
             )
-        else:
-            for idx, chunk_text_value in chunks:
-                vec = Vector(inbox_id=inbox.id, chunk_index=idx, chunk_text=chunk_text_value)
-                session.add(vec)
-                session.flush()
-                embedding = await get_embedding(chunk_text_value)
-                points.append(
-                    qmodels.PointStruct(
-                        id=str(vec.id),
-                        vector={"dense": embedding},
-                        payload={
-                            "inbox_id": str(inbox.id),
-                            "chunk_index": idx,
-                            "type": inbox.type,
-                            "source": inbox.source,
-                            "filename": inbox.filename,
-                        },
-                    )
-                )
+            _plog(session, inbox.id, "chunk", detail=f"idx={idx} vec={vec.id}")
 
         upsert_vectors(client, points)
+        _plog(session, inbox.id, "qdrant_upsert", detail=f"points={len(points)}")
+
+        _write_neighbours(session, client, str(inbox.id), embeddings)
+        _plog(session, inbox.id, "neighbour", detail=f"searched from {len(embeddings)} chunk(s)")
     except Exception as exc:  # noqa: BLE001
         inbox.status = "embed_error"
         inbox.vectorised = False
+        _plog(session, inbox.id, "embed_error", status="error", detail=str(exc))
         raise HTTPException(status_code=502, detail=f"Embedding/Qdrant failed: {exc}") from exc
 
     inbox.status = "ok"
     inbox.vectorised = True
+    _plog(session, inbox.id, "vectorised", detail=f"chunks={chunk_count}")
     return EmbedResponse(inbox_id=str(inbox.id), chunk_count=chunk_count, embedded=True)
 
 
@@ -154,17 +175,37 @@ async def ingest_document(
 
     data = await file.read()
 
-    # In purely local mode we may not have Minio/Qdrant running; just create/update inbox
-    # and skip external calls so the endpoint can be tested in isolation.
+    # Extract text from the uploaded file
+    try:
+        extracted_text = extract_text(data, filename)
+    except ValueError as exc:
+        _plog(session, None, "embed_error", status="error", detail=f"extract failed: {filename}: {exc}")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing: Inbox | None = (
+        session.query(Inbox)
+        .filter(Inbox.filename == filename, Inbox.type == "document")
+        .one_or_none()
+    )
+
+    change_ratio: float = 1.0  # default: treat as fully changed (new doc)
+    # --- Diff check: skip re-embedding if content hasn't meaningfully changed ---
+    if existing is not None:
+        change_ratio = jaccard_change_ratio(existing.raw_text or "", extracted_text)
+        if change_ratio < 0.05:
+            _plog(session, existing.id, "diff_skip", status="skipped", detail=f"change_ratio={change_ratio:.3f}")
+            return DocResponse(
+                status="no_change",
+                inbox_id=str(existing.id),
+                filename=filename,
+                is_new=False,
+                chunk_count=0,
+            )
+
     if settings.ENVIRONMENT == "local":
-        existing: Inbox | None = (
-            session.query(Inbox)
-            .filter(Inbox.filename == filename, Inbox.type == "document")
-            .one_or_none()
-        )
         if existing is None:
             inbox = Inbox(
-                raw_text=x_ob_description or "",
+                raw_text=extracted_text,
                 source=x_ob_source or "unknown",
                 type="document",
                 filename=filename,
@@ -177,23 +218,23 @@ async def ingest_document(
             )
             session.add(inbox)
             session.flush()
-            return DocResponse(status="ok", inbox_id=str(inbox.id), filename=filename, is_new=True)
-        return DocResponse(status="ok", inbox_id=str(existing.id), filename=filename, is_new=False)
-
-    existing: Inbox | None = (
-        session.query(Inbox)
-        .filter(Inbox.filename == filename, Inbox.type == "document")
-        .one_or_none()
-    )
+            _plog(session, inbox.id, "inbox_created", detail=f"local mode filename={filename}")
+            return DocResponse(status="ok", inbox_id=str(inbox.id), filename=filename, is_new=True, chunk_count=0)
+        existing.raw_text = extracted_text
+        existing.vectorised = False
+        existing.vectorised_at = None
+        existing.status = "pending"
+        _plog(session, existing.id, "inbox_created", detail=f"local mode update filename={filename}")
+        return DocResponse(status="ok", inbox_id=str(existing.id), filename=filename, is_new=False, chunk_count=0)
 
     s3 = get_s3_client()
-    client = get_qdrant_client()
+    qdrant = get_qdrant_client()
+
+    s3.put_object(Bucket=settings.S3_BUCKET_FILES, Key=filename, Body=data)
 
     if existing is None:
-        # New document path
-        s3.put_object(Bucket=settings.S3_BUCKET_FILES, Key=filename, Body=data)
         inbox = Inbox(
-            raw_text=x_ob_description,
+            raw_text=extracted_text,
             source=x_ob_source or "unknown",
             type="document",
             filename=filename,
@@ -206,19 +247,75 @@ async def ingest_document(
         )
         session.add(inbox)
         session.flush()
+        _plog(session, inbox.id, "inbox_created", detail=f"new doc filename={filename}")
+        is_new = True
+    else:
+        qdrant.delete(
+            collection_name=settings.QDRANT_COLLECTION,
+            points_selector=qmodels.FilterSelector(
+                filter=qmodels.Filter(
+                    must=[qmodels.FieldCondition(key="inbox_id", match=qmodels.MatchValue(value=str(existing.id)))]
+                )
+            ),
+        )
+        session.query(Vector).filter(Vector.inbox_id == existing.id).delete()
+        existing.raw_text = extracted_text
+        existing.vectorised = False
+        existing.vectorised_at = None
+        existing.status = "pending"
+        session.flush()
+        inbox = existing
+        _plog(session, inbox.id, "purge", detail=f"re-embed filename={filename} change_ratio={change_ratio:.3f}")
+        is_new = False
 
-        # For now we don't extract full text; embedding will be driven elsewhere
-        # or extended later with document extraction as needed.
-        inbox.status = "ok"
-        return DocResponse(status="ok", inbox_id=str(inbox.id), filename=filename, is_new=True)
+    chunks = chunk_text(extracted_text)
+    points: list[qmodels.PointStruct] = []
+    embeddings: list[list[float]] = []
 
-    # Existing document: overwrite file and mark stale.
-    s3.put_object(Bucket=settings.S3_BUCKET_FILES, Key=filename, Body=data)
-    existing.vectorised = False
-    existing.vectorised_at = None
-    existing.status = "pending"
+    try:
+        for idx, chunk_text_value in chunks:
+            vec = Vector(inbox_id=inbox.id, chunk_index=idx, chunk_text=chunk_text_value)
+            session.add(vec)
+            session.flush()
+            embedding = await get_embedding(chunk_text_value)
+            embeddings.append(embedding)
+            points.append(
+                qmodels.PointStruct(
+                    id=str(vec.id),
+                    vector={"dense": embedding},
+                    payload={
+                        "inbox_id": str(inbox.id),
+                        "chunk_index": idx,
+                        "type": "document",
+                        "source": inbox.source,
+                        "filename": filename,
+                    },
+                )
+            )
+            _plog(session, inbox.id, "chunk", detail=f"idx={idx} vec={vec.id}")
 
-    return DocResponse(status="ok", inbox_id=str(existing.id), filename=filename, is_new=False)
+        upsert_vectors(qdrant, points)
+        _plog(session, inbox.id, "qdrant_upsert", detail=f"points={len(points)}")
+
+        _write_neighbours(session, qdrant, str(inbox.id), embeddings)
+        _plog(session, inbox.id, "neighbour", detail=f"searched from {len(embeddings)} chunk(s)")
+    except Exception as exc:  # noqa: BLE001
+        inbox.status = "embed_error"
+        _plog(session, inbox.id, "embed_error", status="error", detail=str(exc))
+        raise HTTPException(status_code=502, detail=f"Embedding/Qdrant failed: {exc}") from exc
+
+    inbox.vectorised = True
+    inbox.vectorised_at = datetime.utcnow()
+    inbox.status = "ok"
+    _plog(session, inbox.id, "vectorised", detail=f"chunks={len(chunks)} filename={filename}")
+
+    return DocResponse(
+        status="ok",
+        inbox_id=str(inbox.id),
+        filename=filename,
+        is_new=is_new,
+        chunk_count=len(chunks),
+    )
 
 
 @app.post("/search/text", response_model=SearchResponse)

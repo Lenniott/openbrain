@@ -70,6 +70,38 @@ def search_by_vector(
     )
 
 
+def find_neighbours(
+    client: QdrantClient,
+    query_vector: list[float],
+    exclude_inbox_id: str,
+    limit: int = 10,
+    score_threshold: float = 0.5,
+) -> list[tuple[str, float]]:
+    """
+    Search for nearest neighbours in Qdrant, excluding chunks belonging to
+    the same inbox item. Returns list of (inbox_id, distance) pairs.
+    Distance = 1 - cosine_score (lower = more similar).
+    """
+    hits = client.search(
+        collection_name=settings.QDRANT_COLLECTION,
+        query_vector=("dense", query_vector),
+        limit=limit + 20,  # fetch extra so we have enough after deduplication
+        score_threshold=score_threshold,
+        with_payload=True,
+    )
+    seen_inbox_ids: set[str] = {exclude_inbox_id}
+    neighbours: list[tuple[str, float]] = []
+    for h in hits:
+        nid = (h.payload or {}).get("inbox_id")
+        if not nid or nid in seen_inbox_ids:
+            continue
+        seen_inbox_ids.add(nid)
+        neighbours.append((nid, round(1.0 - h.score, 6)))
+        if len(neighbours) >= limit:
+            break
+    return neighbours
+
+
 def search_by_point_id(
     client: QdrantClient,
     point_id: str,
