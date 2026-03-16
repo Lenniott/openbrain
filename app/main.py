@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from qdrant_client.http import models as qmodels
@@ -140,8 +140,6 @@ async def ingest_document(
     x_ob_session_id: Annotated[str | None, Header(alias="x-ob-session-id")] = None,
     x_ob_description: Annotated[str | None, Header(alias="x-ob-description")] = None,
 ) -> DocResponse:
-    from fastapi import Header
-
     filename = x_ob_filename or file.filename
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required (x-ob-filename or file.filename)")
